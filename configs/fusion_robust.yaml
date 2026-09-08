@@ -1,0 +1,45 @@
+# SCAFFOLD — Phase 5 (fusion + modality-dropout robustness training).
+# Not yet runnable: src/training/modality_dropout.py is a stub.
+# Extends fusion_full.yaml with the dropout schedule that will be read by
+# that module once implemented.
+
+seed: 42
+
+data:
+  ptbxl_dir: data/raw/ptbxl
+  train_sites: [1]
+  test_sites: [2]
+  use_text_modality: true
+
+model:
+  signal_embed_dim: 128
+  channel_widths: [32, 64, 128, 128]
+  text_encoder_name: "distilbert-base-uncased"
+  text_embed_dim: 128
+  fusion_strategy: "concat"
+  hidden_dim: 64
+
+train:
+  batch_size: 32
+  epochs: 20
+  lr: 0.0005
+  weight_decay: 0.00001
+  num_workers: 2
+
+modality_dropout:
+  enabled: true
+  p_drop_signal: 0.15    # probability of zeroing the signal modality per training sample
+  p_drop_text: 0.15      # probability of zeroing the text modality per training sample
+  # p(both present) = 1 - p_drop_signal - p_drop_text; kept mutually exclusive
+  # per-sample so training always sees at least one modality.
+
+eval:
+  # At test time we run three passes over the target domain to measure
+  # src.evaluation.metrics.modality_degradation:
+  conditions: ["full", "signal_only", "text_only"]
+
+rare_class:
+  k: 5
+
+output:
+  run_dir: experiments/results/fusion_robust_site1v2

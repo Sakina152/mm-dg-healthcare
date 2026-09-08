@@ -1,0 +1,34 @@
+# SCAFFOLD — Phase 3 (multimodal fusion, both modalities always present).
+# Not yet runnable: src/models/fusion.py and src/models/text_encoder.py
+# are stubs. Fields below are the interface those modules will read once
+# implemented; kept here now so Phase 1's config pattern doesn't need to
+# change shape later.
+
+seed: 42
+
+data:
+  ptbxl_dir: data/raw/ptbxl
+  train_sites: [1]
+  test_sites: [2]
+  use_text_modality: true      # PTBXLTextLookup (see src/data/ptbxl_text.py)
+
+model:
+  signal_embed_dim: 128
+  channel_widths: [32, 64, 128, 128]
+  text_encoder_name: "distilbert-base-uncased"  # placeholder; revisit for a biomedical variant
+  text_embed_dim: 128
+  fusion_strategy: "concat"    # concat | cross_attention (TODO: decide in Phase 3)
+  hidden_dim: 64
+
+train:
+  batch_size: 32              # smaller than baseline: text encoder adds memory cost
+  epochs: 20
+  lr: 0.0005
+  weight_decay: 0.00001
+  num_workers: 2
+
+rare_class:
+  k: 5
+
+output:
+  run_dir: experiments/results/fusion_full_site1v2

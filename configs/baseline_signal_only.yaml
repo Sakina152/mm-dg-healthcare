@@ -1,0 +1,32 @@
+# Phase 1 baseline: signal-only ECG classifier, tested under domain shift.
+# Mirrors the reference paper's "across-trial validation" (train on one
+# site/center, test unmodified on another).
+#
+# To sweep to a different site pair, copy this file (don't edit shared
+# configs in place) — e.g. configs/baseline_signal_only_site2v3.yaml —
+# so every run's config snapshot in experiments/results/ stays meaningful.
+
+seed: 42
+
+data:
+  ptbxl_dir: data/raw/ptbxl
+  train_sites: [1]     # PTB-XL site id used for training ("Center A")
+  test_sites: [2]      # PTB-XL site id held out for testing ("Center B")
+
+model:
+  embed_dim: 128
+  channel_widths: [32, 64, 128, 128]
+  hidden_dim: 64        # null / omit for a plain linear head
+
+train:
+  batch_size: 64
+  epochs: 20
+  lr: 0.001
+  weight_decay: 0.00001
+  num_workers: 2
+
+rare_class:
+  k: 5                  # neighbors used in the entropy density estimate
+
+output:
+  run_dir: experiments/results/baseline_signal_only_site1v2
