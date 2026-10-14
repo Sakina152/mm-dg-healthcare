@@ -32,37 +32,32 @@ from src.utils.seed import set_seed, worker_init_fn
 
 
 def build_data(cfg: Config):
-    """Load PTB-XL metadata, apply the domain-shift split, and wrap both
-    sides in `PTBXLDataset` + `DataLoader`.
+    """Build source train/validation loaders and a separate target loader.
+
+    The target domain is never used for epoch selection. Metadata split and
+    labels are shared with the multimodal trainer.
     """
+    from sklearn.model_selection import train_test_split
+
     metadata = load_ptbxl_metadata(cfg.data.ptbxl_dir)
-    split = split_by_domain(
-        metadata,
-        domain_col="site",
-        train_domains=cfg.data.train_sites,
-        test_domains=cfg.data.test_sites,
-    )
+    split = split_by_domain(metadata, domain_col="site", train_domains=cfg.data.train_sites,
+                            test_domains=cfg.data.test_sites)
     print(split.summary())
-
+    val_fraction = float(cfg.train.get("validation_fraction", 0.15))
+    train_df, val_df = train_test_split(
+        split.train_df, test_size=val_fraction, random_state=int(cfg.get("seed", 42)),
+        stratify=split.train_df["superclass"]
+    )
     label_to_idx = {c: i for i, c in enumerate(DIAGNOSTIC_SUPERCLASSES)}
-    train_ds = PTBXLDataset(split.train_df, cfg.data.ptbxl_dir, label_to_idx)
-    test_ds = PTBXLDataset(split.test_df, cfg.data.ptbxl_dir, label_to_idx)
-
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=cfg.train.batch_size,
-        shuffle=True,
-        num_workers=cfg.train.get("num_workers", 2),
-        worker_init_fn=worker_init_fn,
-        drop_last=True,
-    )
-    test_loader = DataLoader(
-        test_ds,
-        batch_size=cfg.train.batch_size,
-        shuffle=False,
-        num_workers=cfg.train.get("num_workers", 2),
-    )
-    return train_loader, test_loader, label_to_idx
+    train_ds = PTBXLDataset(train_df, cfg.data.ptbxl_dir, label_to_idx)
+    val_ds = PTBXLDataset(val_df, cfg.data.ptbxl_dir, label_to_idx)
+    target_ds = PTBXLDataset(split.test_df, cfg.data.ptbxl_dir, label_to_idx)
+    common = dict(batch_size=cfg.train.batch_size, num_workers=cfg.train.get("num_workers", 2),
+                  worker_init_fn=worker_init_fn)
+    train_loader = DataLoader(train_ds, shuffle=True, drop_last=False, **common)
+    val_loader = DataLoader(val_ds, shuffle=False, **common)
+    target_loader = DataLoader(target_ds, shuffle=False, **common)
+    return train_loader, val_loader, target_loader, label_to_idx
 
 
 def build_model(cfg: Config, num_classes: int) -> torch.nn.Module:
@@ -128,61 +123,50 @@ def train(cfg: Config) -> dict:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    train_loader, test_loader, label_to_idx = build_data(cfg)
+    train_loader, val_loader, target_loader, label_to_idx = build_data(cfg)
     num_classes = len(label_to_idx)
     model = build_model(cfg, num_classes).to(device)
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.train.lr, weight_decay=cfg.train.get("weight_decay", 0.0))
+    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.train.lr,
+                                 weight_decay=cfg.train.get("weight_decay", 0.0))
     criterion = torch.nn.CrossEntropyLoss()
-
     run_dir = Path(cfg.output.run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
-    save_config(cfg, run_dir / "config_used.yaml")  # snapshot: results never separated from settings
+    save_config(cfg, run_dir / "config_used.yaml")
 
+    rare_name = str(cfg.rare_class.get("name", "HYP"))
+    if rare_name not in label_to_idx:
+        raise ValueError(f"Unknown rare class {rare_name}; choose one of {list(label_to_idx)}")
+    rare_labels = [label_to_idx[rare_name]]
     history = []
-    best_rare_f1 = -1.0
+    best_val_rare_f1 = -1.0
     for epoch in range(cfg.train.epochs):
         t0 = time.time()
-        train_loss, train_preds, train_labels = run_epoch(model, train_loader, optimizer, criterion, device, train=True)
-        test_loss, test_preds, test_labels = run_epoch(model, test_loader, optimizer, criterion, device, train=False)
-
-        # Rare class is identified once per run, on this run's TRAIN-domain
-        # embeddings (matching Definition 2's intent: rarity is a property
-        # of the source domain the model learns from), then reused across
-        # epochs so the "rare class" definition doesn't drift mid-training.
-        if epoch == cfg.train.epochs - 1:
-            train_emb, train_emb_labels = extract_embeddings(model, train_loader, device)
-            entropy_result = identify_rare_classes(train_emb, train_emb_labels, k=cfg.rare_class.get("k", 5))
-            rare_labels = entropy_result.rare_classes or [int(np.bincount(train_labels).argmin())]
-        else:
-            rare_labels = [int(np.bincount(train_labels).argmin())]  # cheap proxy during training
-
-        test_metrics = compute_metrics(
-            test_labels, test_preds, class_labels=list(range(num_classes)), rare_class_labels=rare_labels
-        )
-
-        epoch_record = {
-            "epoch": epoch,
-            "train_loss": train_loss,
-            "test_loss": test_loss,
-            "test_metrics": test_metrics.to_dict(),
-            "elapsed_sec": time.time() - t0,
-        }
-        history.append(epoch_record)
-        print(f"[epoch {epoch}] train_loss={train_loss:.4f} test_loss={test_loss:.4f} {test_metrics}")
-
-        if test_metrics.rare_class_f1 > best_rare_f1:
-            best_rare_f1 = test_metrics.rare_class_f1
+        train_loss, _, _ = run_epoch(model, train_loader, optimizer, criterion, device, train=True)
+        val_loss, val_preds, val_labels = run_epoch(model, val_loader, optimizer, criterion, device, train=False)
+        val_metrics = compute_metrics(val_labels, val_preds, class_labels=list(range(num_classes)),
+                                      rare_class_labels=rare_labels)
+        record = {"epoch": epoch + 1, "train_loss": train_loss, "validation_loss": val_loss,
+                  "validation_metrics": val_metrics.to_dict(), "elapsed_sec": time.time() - t0}
+        history.append(record)
+        print(f"[epoch {epoch + 1}] train_loss={train_loss:.4f} val_loss={val_loss:.4f} {val_metrics}")
+        if val_metrics.rare_class_f1 > best_val_rare_f1:
+            best_val_rare_f1 = val_metrics.rare_class_f1
             torch.save(model.state_dict(), run_dir / "best_model.pt")
 
     with open(run_dir / "history.json", "w") as f:
         json.dump(history, f, indent=2)
-
-    final = history[-1]["test_metrics"]
+    # Target site is evaluated once, after checkpoint selection is complete.
+    model.load_state_dict(torch.load(run_dir / "best_model.pt", map_location=device, weights_only=True))
+    target_loss, target_preds, target_labels = run_epoch(model, target_loader, None, criterion, device, train=False)
+    target_metrics = compute_metrics(target_labels, target_preds, class_labels=list(range(num_classes)),
+                                     rare_class_labels=rare_labels)
+    final = {"rare_class": rare_name, "checkpoint_selection": "source-site validation rare-class F1",
+             "best_source_validation_rare_f1": best_val_rare_f1,
+             "target_test_loss": target_loss, "target_metrics": target_metrics.to_dict()}
     with open(run_dir / "metrics.json", "w") as f:
         json.dump(final, f, indent=2)
-
-    print(f"\nDone. Results written to {run_dir}/")
+    print(f"\nTarget-domain result: {target_metrics}")
+    print(f"Done. Results written to {run_dir}/")
     return final
 
 
